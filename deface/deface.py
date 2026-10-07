@@ -16,6 +16,8 @@ import cv2
 
 from deface import __version__
 from deface.centerface import CenterFace
+from deface.keep import KeepFilter, parse_zone, select_faces
+from deface.recognition import DEFAULT_MATCH_THRESH, FaceRecognizer, load_identities
 
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
@@ -78,10 +80,20 @@ def draw_det(
 
 def anonymize_frame(
         dets, frame, mask_scale,
-        replacewith, ellipse, draw_scores, replaceimg, mosaicsize
+        replacewith, ellipse, draw_scores, replaceimg, mosaicsize,
+        lms=None, keep_fn=None
 ):
+    if keep_fn is not None:
+        keep, sims = keep_fn(frame, dets, lms)
     for i, det in enumerate(dets):
         boxes, score = det[:4], det[4]
+        if keep_fn is not None and keep[i]:
+            if draw_scores:
+                x1, y1, x2, y2 = boxes.astype(int)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                label = 'keep' if np.isnan(sims[i]) else f'keep {sims[i]:.2f}'
+                cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 0))
+            continue
         x1, y1, x2, y2 = boxes.astype(int)
         x1, y1, x2, y2 = scale_bb(x1, y1, x2, y2, mask_scale)
         # Clip bb coordinates to valid frame region
@@ -118,7 +130,8 @@ def video_detect(
         replaceimg = None,
         keep_audio: bool = False,
         mosaicsize: int = 20,
-        disable_progress_output = False
+        disable_progress_output = False,
+        keep_fn = None
 ):
     try:
         if 'fps' in ffmpeg_config:
@@ -159,13 +172,13 @@ def video_detect(
         )
 
     for frame in read_iter:
-        # Perform network inference, get bb dets but discard landmark predictions
-        dets, _ = centerface(frame, threshold=threshold)
+        # Perform network inference, get bb dets and landmarks (used for face recognition)
+        dets, lms = centerface(frame, threshold=threshold)
 
         anonymize_frame(
             dets, frame, mask_scale=mask_scale,
             replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-            replaceimg=replaceimg, mosaicsize=mosaicsize
+            replaceimg=replaceimg, mosaicsize=mosaicsize, lms=lms, keep_fn=keep_fn
         )
 
         if opath is not None:
@@ -196,6 +209,7 @@ def image_detect(
         keep_metadata: bool,
         replaceimg = None,
         mosaicsize: int = 20,
+        keep_fn = None
 ):
     frame = iio.imread(ipath)
 
@@ -204,13 +218,13 @@ def image_detect(
         metadata = imageio.v3.immeta(ipath)
         exif_dict = metadata.get("exif", None)
 
-    # Perform network inference, get bb dets but discard landmark predictions
-    dets, _ = centerface(frame, threshold=threshold)
+    # Perform network inference, get bb dets and landmarks (used for face recognition)
+    dets, lms = centerface(frame, threshold=threshold)
 
     anonymize_frame(
         dets, frame, mask_scale=mask_scale,
         replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg, mosaicsize=mosaicsize
+        replaceimg=replaceimg, mosaicsize=mosaicsize, lms=lms, keep_fn=keep_fn
     )
 
     if enable_preview:
@@ -248,20 +262,22 @@ def get_anonymized_image(frame,
                          mask_scale: float,
                          ellipse: bool,
                          draw_scores: bool,
-                         replaceimg = None
+                         replaceimg = None,
+                         keep_fn = None
                          ):
     """
     Method for getting an anonymized image without CLI
+    keep_fn: optional deface.keep.KeepFilter, faces it keeps are not anonymized
     returns frame
     """
 
     centerface = CenterFace(in_shape=None, backend='auto')
-    dets, _ = centerface(frame, threshold=threshold)
+    dets, lms = centerface(frame, threshold=threshold)
 
     anonymize_frame(
         dets, frame, mask_scale=mask_scale,
         replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg
+        replaceimg=replaceimg, lms=lms, keep_fn=keep_fn
     )
 
     return frame
@@ -324,6 +340,24 @@ def parse_cli_args():
     parser.add_argument(
         '--keep-metadata', '-m', default=False, action='store_true',
         help='Keep metadata of the original image. Default : False.')
+    parser.add_argument(
+        '--keep-zone', action='append', default=[], type=parse_zone, metavar='X1,Y1,X2,Y2',
+        help='Do not anonymize faces whose center lies in this rectangle. Coordinates are pixels, or fractions of the frame size if all values are <= 1 (e.g. 0.25,0,0.75,1 for the center half). Can be repeated.')
+    parser.add_argument(
+        '--keep-face', action='append', default=[], metavar='PATH',
+        help='Do not anonymize the person shown in this reference picture. Accepts an image, a directory of images of the same person (several pictures improve matching) or a keep.npz file written by --select-faces. Repeat for several persons. Each person is kept at most once per frame.')
+    parser.add_argument(
+        '--select-faces', default=False, action='store_true',
+        help='Run a first detection pass over each input, save the distinct faces found to <output>_faces/ and ask in the terminal which ones should not be anonymized.')
+    parser.add_argument(
+        '--keep-thresh', default=DEFAULT_MATCH_THRESH, type=float, metavar='K',
+        help=f'Face recognition similarity threshold for --keep-face and --select-faces. Higher is stricter (fewer bystanders wrongly kept, but the kept person may be anonymized in some frames). Default: {DEFAULT_MATCH_THRESH}.')
+    parser.add_argument(
+        '--keep-carry', default=5, type=int, metavar='N',
+        help='Videos: keep a face for up to N frames after its last positive match if it stays at the same place, to avoid flickering when recognition briefly fails. 0 disables. Default: 5.')
+    parser.add_argument(
+        '--select-stride', default=None, type=int, metavar='N',
+        help='Analyze every N-th frame in the --select-faces pass. Default: one frame per second.')
     parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
 
     args = parser.parse_args()
@@ -371,6 +405,7 @@ def main():
     keep_metadata = args.keep_metadata
     replaceimg = None
     disable_progress_output = args.disable_progress_output
+    keep_thresh = args.keep_thresh
 
     if in_shape is not None:
         w, h = in_shape.split('x')
@@ -382,6 +417,18 @@ def main():
 
     # TODO: scalar downscaling setting (-> in_shape), preserving aspect ratio
     centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
+
+    keep_zones = args.keep_zone
+    recognizer, keep_identities = None, []
+    if args.keep_face or args.select_faces:
+        recognizer = FaceRecognizer()
+    if args.keep_face:
+        try:
+            keep_identities = load_identities(args.keep_face, centerface, recognizer, threshold)
+        except (ValueError, OSError) as e:
+            print(f'Could not load --keep-face reference: {e}')
+            exit(1)
+        print(f'Loaded {len(keep_identities)} reference person(s) to keep.')
 
     multi_file = len(ipaths) > 1
     if multi_file:
@@ -400,6 +447,35 @@ def main():
         print(f'Input:  {ipath}\nOutput: {opath}')
         if opath is None and not enable_preview:
             print('No output file is specified and the preview GUI is disabled. No output will be produced.')
+
+        identities = keep_identities
+        if args.select_faces and filetype in ('video', 'image'):
+            try:
+                selected = select_faces(
+                    ipath=ipath,
+                    filetype=filetype,
+                    out_dir=f'{os.path.splitext(opath)[0]}_faces',
+                    centerface=centerface,
+                    recognizer=recognizer,
+                    threshold=threshold,
+                    match_thresh=keep_thresh,
+                    stride=args.select_stride,
+                    enable_preview=enable_preview,
+                    disable_progress_output=disable_progress_output
+                )
+            except ValueError as e:
+                print(f'Face selection failed: {e}')
+                exit(1)
+            identities = identities + selected
+        elif args.select_faces and is_cam:
+            print('--select-faces is not supported for camera input, ignoring it.')
+        keep_fn = None
+        if keep_zones or identities:
+            keep_fn = KeepFilter(
+                zones=keep_zones, recognizer=recognizer, identities=identities,
+                match_thresh=keep_thresh, carry=args.keep_carry
+            )
+
         if filetype == 'video' or is_cam:
             video_detect(
                 ipath=ipath,
@@ -417,7 +493,8 @@ def main():
                 ffmpeg_config=ffmpeg_config,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
-                disable_progress_output=disable_progress_output
+                disable_progress_output=disable_progress_output,
+                keep_fn=keep_fn
             )
         elif filetype == 'image':
             image_detect(
@@ -432,7 +509,8 @@ def main():
                 enable_preview=enable_preview,
                 keep_metadata=keep_metadata,
                 replaceimg=replaceimg,
-                mosaicsize=mosaicsize
+                mosaicsize=mosaicsize,
+                keep_fn=keep_fn
             )
         elif filetype is None:
             print(f'Can\'t determine file type of file {ipath}. Skipping...')

@@ -55,11 +55,13 @@ The output may vary depending on your installed version, but it should look simi
 
 ```
 usage: deface [--output O] [--thresh T] [--scale WxH] [--preview] [--boxes]
-              [--draw-scores] [--mask-scale M]
+              [--draw-scores] [--disable-progress-output] [--mask-scale M]
               [--replacewith {blur,solid,none,img,mosaic}]
               [--replaceimg REPLACEIMG] [--mosaicsize width] [--keep-audio]
               [--ffmpeg-config FFMPEG_CONFIG] [--backend {auto,onnxrt,opencv}]
-              [--execution-provider EP] [--version] [--help]
+              [--execution-provider EP] [--version] [--keep-metadata]
+              [--keep-zone X1,Y1,X2,Y2] [--keep-face PATH] [--select-faces]
+              [--keep-thresh K] [--keep-carry N] [--select-stride N] [--help]
               [input ...]
 
 Video anonymization by face detection
@@ -74,12 +76,12 @@ positional arguments:
                         demo can be started by running `$ deface cam` (which
                         is a shortcut for `$ deface -p '<video0>'`.
 
-optional arguments:
-  --output O, -o O      Output file name. Defaults to input path + postfix
+options:
+  --output, -o O        Output file name. Defaults to input path + postfix
                         "_anonymized".
-  --thresh T, -t T      Detection threshold (tune this to trade off between
+  --thresh, -t T        Detection threshold (tune this to trade off between
                         false positive and false negative rate). Default: 0.2.
-  --scale WxH, -s WxH   Downscale images for network inference to this size
+  --scale, -s WxH       Downscale images for network inference to this size
                         (format: WxH, example: --scale 640x360).
   --preview, -p         Enable live preview GUI (can decrease performance).
   --boxes               Use boxes instead of ellipse masks.
@@ -110,13 +112,38 @@ optional arguments:
   --backend {auto,onnxrt,opencv}
                         Backend for ONNX model execution. Default: "auto"
                         (prefer onnxrt if available).
-  --execution-provider EP, --ep EP
+  --execution-provider, --ep EP
                         Override onnxrt execution provider (see
                         https://onnxruntime.ai/docs/execution-providers/). If
                         not specified, the presumably fastest available one
-                        will be automatically selected. Only used if backend is
-                        onnxrt.
+                        will be automatically selected. Only used if backend
+                        is onnxrt.
   --version             Print version number and exit.
+  --keep-metadata, -m   Keep metadata of the original image. Default : False.
+  --keep-zone X1,Y1,X2,Y2
+                        Do not anonymize faces whose center lies in this
+                        rectangle. Coordinates are pixels, or fractions of the
+                        frame size if all values are <= 1 (e.g. 0.25,0,0.75,1
+                        for the center half). Can be repeated.
+  --keep-face PATH      Do not anonymize the person shown in this reference
+                        picture. Accepts an image, a directory of images of
+                        the same person (several pictures improve matching) or
+                        a keep.npz file written by --select-faces. Repeat for
+                        several persons. Each person is kept at most once per
+                        frame.
+  --select-faces        Run a first detection pass over each input, save the
+                        distinct faces found to <output>_faces/ and ask in the
+                        terminal which ones should not be anonymized.
+  --keep-thresh K       Face recognition similarity threshold for --keep-face
+                        and --select-faces. Higher is stricter (fewer
+                        bystanders wrongly kept, but the kept person may be
+                        anonymized in some frames). Default: 0.5.
+  --keep-carry N        Videos: keep a face for up to N frames after its last
+                        positive match if it stays at the same place, to avoid
+                        flickering when recognition briefly fails. 0 disables.
+                        Default: 5.
+  --select-stride N     Analyze every N-th frame in the --select-faces pass.
+                        Default: one frame per second.
   --help, -h            Show this help message and exit.
 ```
 
@@ -169,6 +196,36 @@ If you are interested in seeing the faceness score (a score between 0 and 1 that
 <img src="examples/city_anonymized_scores.jpg" width="70%" alt="$ deface examples/city.jpg --draw-scores -o examples/city_anonymized_scores.jpg"/>
 
 This option can be useful to figure out an optimal value for the detection threshold that can then be set through the `--thresh` option.
+
+
+### Keeping selected faces visible
+
+Sometimes one person should stay recognizable, e.g. the host of a vlog or an interviewee, while everybody else is anonymized. There are three ways to tell `deface` which faces to keep. They can be combined.
+
+**By zone**: `--keep-zone X1,Y1,X2,Y2` keeps every face whose center lies in the given rectangle. Coordinates are in pixels, or fractions of the frame size if all values are <= 1. This is useful if the main person stays at a fixed position, e.g. a static interview shot:
+
+    $ deface examples/city.jpg --keep-zone 0,0,0.5,1
+
+**By reference picture**: `--keep-face` keeps the person shown in a reference picture, using face recognition (OpenCV's [SFace](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface) model). Pass an image, or a directory with several pictures of the same person for more reliable matching. Repeat the option to keep several persons:
+
+    $ deface myvideos/vid1.mp4 --keep-face me.jpg --keep-face my_friend_photos/
+
+**By interactive selection**: `--select-faces` first scans the input (one frame per second for videos, see `--select-stride`), groups the faces it finds by identity, saves one picture of each person to `<output>_faces/` and asks in the terminal which ones to keep. With `--preview`, the faces are also shown in a window. The selection is saved as `<output>_faces/keep.npz` and can be reused without the prompt via `--keep-face`:
+
+    $ deface myvideos/vid1.mp4 --select-faces
+    Face selection: 4 distinct faces found, crops saved to myvideos/vid1_anonymized_faces
+      0: face_00.png, seen in 52 of 60 sampled frames
+      ...
+    Faces to keep, comma separated indices 0-3 (e.g. 0,2) [none]: 0
+    $ deface myvideos/vid2.mp4 --keep-face myvideos/vid1_anonymized_faces/keep.npz
+
+A person may be split into several entries (e.g. frontal and profile views), select all of them.
+
+Notes:
+- Each kept person is kept at most once per frame (the best match), so look-alikes and overlapping detections stay anonymized.
+- In videos, a kept face stays kept for up to `--keep-carry` frames (default: 5) while it does not move away, to avoid flickering when recognition briefly fails.
+- `--keep-thresh` sets how similar a face must be to a reference (default: 0.5). Raise it if bystanders are wrongly kept, lower it if the kept person is anonymized in too many frames. With `--draw-scores`, kept faces are framed in green and labeled with their similarity, which helps tuning.
+- Face recognition is not perfect: always check the output (e.g. with `--preview`) before publishing it, a wrong match leaves a bystander unanonymized.
 
 
 ### High-resolution media and performance issues
@@ -231,4 +288,5 @@ The face bounding boxes predicted by the CenterFace detector are then used as ma
 - `centerface.py` is based on https://github.com/Star-Clouds/centerface (revision [8c39a49](https://github.com/Star-Clouds/CenterFace/tree/8c39a497afb78fb2c064eb84bf010c273bb7d3ce)),
   [released under MIT license](https://github.com/Star-Clouds/CenterFace/blob/36afed/LICENSE)
 - The included model file `centerface.onnx` is an unmodified copy of the [`centerface_bnmerged.onnx`](https://github.com/Star-Clouds/CenterFace/blob/b82ec0c4844e89fd5a0305986aed9bdf33c72585/models/onnx/centerface_bnmerged.onnx) from https://github.com/Star-Clouds/centerface
+- The included model file `face_recognition_sface_2021dec.onnx` is an unmodified copy of [`face_recognition_sface_2021dec.onnx`](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface) from https://github.com/opencv/opencv_zoo, released under the Apache 2.0 license
 - The original source of the example images in the `examples` directory can be found [here](https://www.pexels.com/de-de/foto/stadt-kreuzung-strasse-menschen-109919/) (released under the [Pexels photo license](https://www.pexels.com/photo-license/))
